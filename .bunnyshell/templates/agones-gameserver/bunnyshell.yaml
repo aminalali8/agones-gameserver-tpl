@@ -1,5 +1,196 @@
-# Bunnyshell YAML Configuration
 kind: Environment
 name: agones-gameserver
 type: primary
-# Add your configuration here
+templateVariables:
+    controller_replicas: 1
+    allocator_replicas: 1
+    image_tag: 1.41.0
+    game_fleet_replicas: 3
+components:
+    -
+        kind: Helm
+        name: agones-system
+        runnerImage: 'dtzar/helm-kubectl:3.8.2'
+        deploy:
+            - 'helm repo add agones https://agones.dev/chart/stable'
+            - |
+                cat << EOF > my_values.yaml
+                agones:
+                  controller:
+                    nodeSelector:
+                      agentpool: agonespool  # Replace with your node pool's label if different
+                    tolerations:
+                      - key: "agones"
+                        operator: "Equal"
+                        value: "true"
+                        effect: "NoSchedule"
+                    http:
+                      port: 8080
+                    replicas: {{template.vars.controller_replicas}}
+                    pdb:
+                        minAvailable: 1
+                  extensions:
+                    nodeSelector:
+                      agentpool: agonespool  # Replace with your node pool's label if different
+                    tolerations:
+                      - key: "agones"
+                        operator: "Equal"
+                        value: "true"
+                        effect: "NoSchedule"
+                    http:
+                      port: 8080
+                    pdb:
+                        minAvailable: 1
+                    replicas: 1
+                  ping:
+                    install: true
+                    pdb:
+                      enabled: false
+                      minAvailable: 1
+                    nodeSelector:
+                      agentpool: agonespool  # Replace with your node pool's label if different
+                    tolerations:
+                      - key: "agones"
+                        operator: "Equal"
+                        value: "true"
+                        effect: "NoSchedule"
+                    replicas: 1
+                    http:
+                      expose: true
+                      response: ok
+                      port: 80
+                      nodePort: 0 # nodePort will be used if the serviceType is set to NodePort
+                      serviceType: LoadBalancer
+                    udp:
+                      expose: true
+                      rateLimit: 20
+                      port: 50000
+                      nodePort: 0 # nodePort will be used if the serviceType is set to NodePort
+                      serviceType: LoadBalancer
+                  allocator:
+                    install: true
+                    pdb:
+                      enabled: false
+                      minAvailable: 1
+                    nodeSelector:
+                      agentpool: agonespool  # Replace with your node pool's label if different
+                    tolerations:
+                      - key: "agones"
+                        operator: "Equal"
+                        value: "true"
+                        effect: "NoSchedule"
+                    replicas: {{template.vars.allocator_replicas}}
+                    service:
+                      name: agones-allocator
+                      serviceType: LoadBalancer
+                      clusterIP: ""
+                      loadBalancerIP: ""
+                      loadBalancerSourceRanges: []
+                      annotations: {}
+                      http:
+                        enabled: true
+                        appProtocol: ""
+                        port: 443
+                        portName: https
+                        targetPort: 8443
+                        nodePort: 0 # nodePort will be used if the serviceType is set to NodePort
+                        unallocatedStatusCode: 429
+                      grpc:
+                        enabled: true
+                        appProtocol: ""
+                        port: 443
+                        portName: grpc
+                        targetPort: 8443
+                        nodePort: 0 # nodePort will be used if the serviceType is set to NodePort
+                  image:
+                    registry: us-docker.pkg.dev/agones-images/release
+                    tag: {{template.vars.image_tag}}
+                    controller:
+                      name: agones-controller
+                      pullPolicy: IfNotPresent
+                    extensions:
+                      name: agones-extensions
+                      pullPolicy: IfNotPresent
+                    sdk:
+                      name: agones-sdk
+                      cpuRequest: 30m
+                      cpuLimit: 0
+                      memoryRequest: 0
+                      memoryLimit: 0
+                      alwaysPull: false
+                    ping:
+                      name: agones-ping
+                      pullPolicy: IfNotPresent
+                    allocator:
+                      name: agones-allocator
+                      pullPolicy: IfNotPresent
+
+                gameservers:
+                  namespaces:
+                  - {{env.k8s.namespace}}
+                  minPort: 7000
+                  maxPort: 8000
+                EOF
+            - 'helm upgrade --install --create-namespace --namespace {{ env.k8s.namespace }} --dependency-update --post-renderer /bns/helpers/helm/add_labels/kustomize -f my_values.yaml agones-{{ env.unique }} agones/agones'
+        destroy:
+            - 'helm uninstall agones-{{ env.unique }} --namespace {{ env.k8s.namespace }}'
+        start:
+            - 'helm repo add agones https://agones.dev/chart/stable'
+            - 'helm upgrade --namespace {{ env.k8s.namespace }} --post-renderer /bns/helpers/helm/add_labels/kustomize --reuse-values --set agones.controller.replicas={{template.vars.controller_replicas}} --set agones.extensions.replicas=1 --set agones.ping.replicas=1 --set agones.allocator.replicas={{template.vars.allocator_replicas}} agones-{{ env.unique }} agones/agones'
+        stop:
+            - 'helm repo add agones https://agones.dev/chart/stable'
+            - 'helm upgrade --namespace {{ env.k8s.namespace }} --post-renderer /bns/helpers/helm/add_labels/kustomize --reuse-values --set agones.controller.replicas=0 --set agones.extensions.replicas=0 --set agones.ping.replicas=0 --set agones.allocator.replicas=0 agones-{{ env.unique }} agones/agones'
+    -
+        kind: KubernetesManifest
+        name: sample-game-fleet
+        runnerImage: 'alpine/k8s:1.22.15'
+        deploy:
+            - |
+                sleep 20
+                cat <<EOF > game-fleet.yaml
+                apiVersion: agones.dev/v1
+                kind: Fleet
+                metadata:
+                  name: simple-game-server
+                spec:
+                  replicas: {{template.vars.game_fleet_replicas}}
+                  template:
+                    spec:
+                      ports:
+                        - name: default
+                          containerPort: 7654
+                      template:
+                        metadata:
+                            labels:
+                                app.kubernetes.io/instance: "{{ component.name }}:bns"
+                                app.kubernetes.io/part-of: "env-{{ env.unique }}"  
+                        spec:
+                          nodeSelector:
+                            agentpool: agonespool  # Ensure this matches the label of your node pool
+                          tolerations:
+                            - 
+                              key: "agones"
+                              operator: "Equal"
+                              value: "true"
+                              effect: "NoSchedule"
+                          containers:
+                            - name: simple-game-server
+                              image: us-docker.pkg.dev/agones-images/examples/simple-game-server:0.32
+                              resources:
+                                requests:
+                                  memory: 64Mi
+                                  cpu: 20m
+                                limits:
+                                  memory: 64Mi
+                                  cpu: 20m
+                EOF
+                kubectl apply -n {{env.k8s.namespace}} -f game-fleet.yaml
+                  
+        destroy:
+            - 'kubectl delete fleet -n {{env.k8s.namespace}} simple-game-server'
+        start:
+            - 'kubectl scale fleet simple-game-server --replicas={{template.vars.game_fleet_replicas}} --namespace {{env.k8s.namespace}}'
+        stop:
+            - 'kubectl scale fleet simple-game-server --replicas=0 --namespace {{env.k8s.namespace}}'
+        dependsOn:
+            - agones-system
